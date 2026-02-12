@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: pgai
+      POSTGRES_USER: pgai
+      POSTGRES_PASSWORD: pgai
+    volumes:
+      - pgai_db:/var/lib/postgresql/data
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pgai:pgai@db:5432/pgai
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    depends_on:
+      - server
+    ports:
+      - "8080:80"
+
+volumes:
+  pgai_db:

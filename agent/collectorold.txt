@@ -1,0 +1,364 @@
+# collector.py
+# Полноценный сборщик метрик и рекомендаций от LLM
+# - Конфиг в коде (без переменных окружения)
+# - Разбивка метрик на блоки
+# - Гарантированный JSON-ответ от LLM
+# - Циклический запуск и сохранение плана в plan.json
+# - Режим рекомендаций (без выполнения)
+
+import json
+import psutil
+import asyncpg
+import asyncio
+import time
+from datetime import datetime
+from typing import Dict, Any, List
+from openai import OpenAI
+
+# ===== Конфиг (заполни под себя) =====
+PG_DSN = "postgresql://postgres:postgres@localhost:5432/postgres"
+OPENAI_API_KEY = "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"
+MODEL = "gpt-4o-mini"           # Используй доступную по API модель
+POLL_INTERVAL_SEC = 60      # Интервал отправки метрик и получения рекомендаций
+MAX_STATEMENTS = 50         # Сколько запросов брать из pg_stat_statements
+RECOMMENDATION_MODE = "on"  # "on" = только рекомендации (без выполнения)
+# =====================================
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+async def list_databases() -> List[str]:
+    conn = await asyncpg.connect(PG_DSN)
+    try:
+        rows = await conn.fetch("""
+          SELECT datname
+          FROM pg_database
+          WHERE datallowconn
+            AND datname NOT IN ('template0','template1')
+          ORDER BY datname;
+        """)
+        return [r["datname"] for r in rows]
+    finally:
+        await conn.close()
+
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+async def fetch_rows(conn, sql: str) -> List[Dict[str, Any]]:
+    try:
+        rows = await conn.fetch(sql)
+        return [normalize(dict(r)) for r in rows]
+    except Exception as e:
+        return [{"error": str(e), "sql": sql}]
+
+# -------- Системные метрики --------
+def collect_system_metrics() -> Dict[str, Any]:
+    cpu_pct = psutil.cpu_percent(interval=1)
+    cpu_times = psutil.cpu_times_percent()
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    cpu_stats = psutil.cpu_stats()
+    disk_io = psutil.disk_io_counters()
+    root_fs = psutil.disk_usage('/')
+    return {
+        "timestamp": now_iso(),
+        "cpu": {
+            "utilization_pct": cpu_pct,
+            "iowait_pct": getattr(cpu_times, "iowait", None),
+            "context_switches": getattr(cpu_stats, "ctx_switches", None),
+        },
+        "memory": {
+            "free_bytes": mem.available,
+            "swap_used_bytes": swap.used,
+            "os_page_cache_bytes": getattr(mem, "cached", None),
+        },
+        "disk": {
+            "iops_read": getattr(disk_io, "read_count", None),
+            "iops_write": getattr(disk_io, "write_count", None),
+            "latency_read_ms": getattr(disk_io, "read_time", None),   # агрегированные мс
+            "latency_write_ms": getattr(disk_io, "write_time", None), # агрегированные мс
+            "throughput_read_bytes": getattr(disk_io, "read_bytes", None),
+            "throughput_write_bytes": getattr(disk_io, "write_bytes", None),
+            "filesystem_root_used_pct": root_fs.percent,
+        },
+    }
+
+# -------- Блоки метрик PostgreSQL --------
+async def collect_pg_buffers_bgwriter(conn) -> Dict[str, Any]:
+    bgwriter = await fetch_rows(conn, "SELECT * FROM pg_stat_bgwriter;")
+    dbstats = await fetch_rows(conn, """
+        SELECT datid, datname, blks_read, blks_hit, tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
+               temp_files, temp_bytes
+        FROM pg_stat_database;
+    """)
+    return {
+        "timestamp": now_iso(),
+        "bgwriter": bgwriter,
+        "database_stats": dbstats,
+    }
+
+async def collect_pg_wal_replication(conn) -> Dict[str, Any]:
+    stat_wal = await fetch_rows(conn, "SELECT * FROM pg_stat_wal;")            # PG >=14
+    replication = await fetch_rows(conn, "SELECT * FROM pg_stat_replication;")
+    wal_receiver = await fetch_rows(conn, "SELECT * FROM pg_stat_wal_receiver;")
+    archiver = await fetch_rows(conn, "SELECT * FROM pg_stat_archiver;")
+    return {
+        "timestamp": now_iso(),
+        "stat_wal": stat_wal,
+        "replication": replication,
+        "wal_receiver": wal_receiver,
+        "archiver": archiver,
+    }
+
+async def collect_pg_temp_files(conn) -> Dict[str, Any]:
+    db_temp = await fetch_rows(conn, """
+        SELECT datname, temp_files, temp_bytes
+        FROM pg_stat_database;
+    """)
+    statements = await fetch_rows(conn, f"""
+        SELECT queryid, calls, rows, total_exec_time, mean_exec_time,
+               shared_blks_hit, shared_blks_read, local_blks_read, temp_blks_read, temp_blks_written, query
+        FROM pg_stat_statements
+        ORDER BY total_exec_time DESC
+        LIMIT {MAX_STATEMENTS};
+    """)
+    return {
+        "timestamp": now_iso(),
+        "database_temp": db_temp,
+        "heavy_statements": statements,
+    }
+
+async def collect_pg_checkpoints_bgwriter(conn) -> Dict[str, Any]:
+    bgwriter = await fetch_rows(conn, "SELECT * FROM pg_stat_bgwriter;")
+    return {
+        "timestamp": now_iso(),
+        "bgwriter": bgwriter
+    }
+
+async def collect_pg_sizes(conn) -> Dict[str, Any]:
+    databases = await fetch_rows(conn, """
+        SELECT d.oid as dbid, d.datname, pg_database_size(d.datname) AS database_size
+        FROM pg_database d;
+    """)
+    relsizes = await fetch_rows(conn, """
+        SELECT
+          n.nspname AS schema,
+          c.relname AS relation,
+          c.relkind,
+          pg_total_relation_size(c.oid) AS total_size,
+          pg_relation_size(c.oid) AS main_size,
+          pg_indexes_size(c.oid) AS index_size,
+          pg_total_relation_size(c.oid) - pg_relation_size(c.oid) - pg_indexes_size(c.oid) AS toast_size
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+          AND c.relkind IN ('r','m')
+        ORDER BY total_size DESC
+        LIMIT 200;
+    """)
+    return {
+        "timestamp": now_iso(),
+        "databases": databases,
+        "relations": relsizes,
+    }
+
+async def collect_pg_connections_activity(conn) -> Dict[str, Any]:
+    activity = await fetch_rows(conn, """
+        SELECT datname, pid, usename, application_name, client_addr, backend_start, state,
+               wait_event_type, wait_event, query
+        FROM pg_stat_activity;
+    """)
+    states = await fetch_rows(conn, """
+        SELECT datname, state, COUNT(*) AS cnt
+        FROM pg_stat_activity
+        GROUP BY datname, state
+        ORDER BY cnt DESC;
+    """)
+    return {
+        "timestamp": now_iso(),
+        "activity": activity,
+        "states": states,
+    }
+
+async def collect_pg_indexes_tables_statements(conn) -> Dict[str, Any]:
+    tables = await fetch_rows(conn, """
+        SELECT n.nspname AS schema, c.relname AS table, s.seq_scan, s.idx_scan, s.n_live_tup, s.n_dead_tup,
+               s.last_vacuum, s.last_autovacuum, s.last_analyze, s.last_autoanalyze
+        FROM pg_stat_user_tables s
+        JOIN pg_class c ON c.oid = s.relid
+        JOIN pg_namespace n ON n.oid = c.relnamespace;
+    """)
+    user_indexes = await fetch_rows(conn, """
+        SELECT s.relname AS table, i.indexrelname AS index, i.idx_scan, i.idx_tup_read, i.idx_tup_fetch
+        FROM pg_stat_user_indexes i
+        JOIN pg_stat_user_tables s ON s.relid = i.relid
+        ORDER BY i.idx_scan ASC;
+    """)
+    statements = await fetch_rows(conn, f"""
+        SELECT queryid, calls, rows, total_exec_time, mean_exec_time,
+               shared_blks_hit, shared_blks_read, local_blks_read, temp_blks_read, temp_blks_written, query
+        FROM pg_stat_statements
+        ORDER BY calls DESC
+        LIMIT {MAX_STATEMENTS};
+    """)
+    return {
+        "timestamp": now_iso(),
+        "tables": tables,
+        "indexes": user_indexes,
+        "statements": statements,
+    }
+
+# -------- Анализ блока через LLM --------
+async def analyze_block(block_name: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Формат ответа строго JSON:
+    {
+      "block": "<block_name>",
+      "actions": [ ... ],
+      "notes": [ ... ]
+    }
+    """
+    prompt = f"""
+Ты — DBA-ассистент PostgreSQL. Проанализируй блок метрик "{block_name}" и предложи улучшения.
+Учитывай проблемы: индексы, vacuum/analyze, work_mem/temp files, checkpoints/bgwriter,
+WAL/репликация, соединения, размеры, I/O. Отвечай строго JSON (без текста вне JSON).
+Структура:
+{{
+  "block": "{block_name}",
+  "actions": [
+    {{
+      "type": "CREATE_INDEX" | "VACUUM" | "ANALYZE" | "ALTER_SYSTEM" | "REINDEX" | "KILL_BACKEND" | "NOOP",
+      "schema": "public",
+      "table": "orders",
+      "column": "customer_id",
+      "indexname": "idx_orders_customer_id",
+      "method": "btree",
+      "where": "status = 'active'",
+      "setting": "work_mem",
+      "value": "64MB",
+      "reason": "почему это нужно",
+      "risk": "low|medium|high"
+    }}
+  ],
+  "notes": ["краткие наблюдения"]
+}}
+Если улучшений нет, верни actions: [] и краткие notes.
+"""
+    response = client.chat.completions.create(
+        model=MODEL,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "Ты DBA-ассистент PostgreSQL. Отвечай строго в JSON."},
+            {"role": "user", "content": prompt},
+            {"role": "user", "content": json.dumps(metrics, ensure_ascii=False, indent=2)}
+        ]
+    )
+    content = response.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        data = {"block": block_name, "actions": [], "notes": ["LLM ответ не JSON"]}
+    data.setdefault("block", block_name)
+    data.setdefault("actions", [])
+    data.setdefault("notes", [])
+    return data
+
+# -------- Главный цикл --------
+from datetime import datetime
+from decimal import Decimal
+import ipaddress
+
+def normalize(obj):
+    """Рекурсивно преобразует проблемные типы в сериализуемые значения."""
+    if isinstance(obj, dict):
+        return {k: normalize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [normalize(v) for v in obj]
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, Decimal):
+        return float(obj)  # или str(obj), если нужна точность
+    elif isinstance(obj, bytes):
+        return obj.hex()   # hex-строка для байтов
+    elif isinstance(obj, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return str(obj)    # строковое представление IP
+    elif isinstance(obj, set):
+        return list(obj)   # множества → список
+    elif obj is None:
+        return None
+    else:
+        try:
+            # Попробуем привести к строке всё остальное
+            json.dumps(obj)
+            return obj
+        except Exception:
+            return str(obj)
+
+async def collect_once_and_analyze() -> Dict[str, Any]:
+    # Системные метрики
+    sys_metrics = collect_system_metrics()
+
+    # PG метрики по блокам
+    conn = await asyncpg.connect(PG_DSN)
+    try:
+        block_buffers = await collect_pg_buffers_bgwriter(conn)
+        block_wal = await collect_pg_wal_replication(conn)
+        block_temp = await collect_pg_temp_files(conn)
+        block_checkpoints = await collect_pg_checkpoints_bgwriter(conn)
+        block_sizes = await collect_pg_sizes(conn)
+        block_conns = await collect_pg_connections_activity(conn)
+        block_ix_tbl_stmt = await collect_pg_indexes_tables_statements(conn)
+    finally:
+        await conn.close()
+
+    # Анализируем по блокам
+    analyzed_blocks = []
+    for name, data in [
+        ("system", sys_metrics),
+        ("buffers_bgwriter", block_buffers),
+        ("wal_replication", block_wal),
+        ("temp_files", block_temp),
+        ("checkpoints_bgwriter", block_checkpoints),
+        ("sizes", block_sizes),
+        ("connections_activity", block_conns),
+        ("indexes_tables_statements", block_ix_tbl_stmt),
+    ]:
+        analyzed = await analyze_block(name, data)
+        analyzed_blocks.append(analyzed)
+
+    # Объединяем действия и заметки
+    actions: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    for blk in analyzed_blocks:
+        actions.extend(blk.get("actions", []))
+        for n in blk.get("notes", []):
+            notes.append(f"[{blk.get('block','?')}] {n}")
+
+    plan = {
+        "timestamp": now_iso(),
+        "mode": "recommendation" if RECOMMENDATION_MODE == "on" else "execute",
+        "actions": actions,
+        "notes": notes,
+        "blocks": analyzed_blocks
+    }
+
+    # нормализуем все datetime → строки
+    return normalize(plan)
+
+async def main():
+    print(f"Starting collector: interval={POLL_INTERVAL_SEC}s, model={MODEL}, mode={RECOMMENDATION_MODE}")
+    while True:
+        try:
+            plan = await collect_once_and_analyze()
+            # выводим и сохраняем
+            print(json.dumps(plan, ensure_ascii=False, indent=2))
+            with open("plan.json", "w", encoding="utf-8") as f:
+                json.dump(plan, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[{now_iso()}] Collector error: {e}")
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+if __name__ == "__main__":
+    if not OPENAI_API_KEY or OPENAI_API_KEY.startswith("<"):
+        raise RuntimeError("OPENAI_API_KEY не задан или плейсхолдер. Вставь реальный ключ в переменную OPENAI_API_KEY.")
+    asyncio.run(main())
