@@ -14,6 +14,10 @@ services:
       dockerfile: server/Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://pgai:pgai@db:5432/pgai
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: gpt-4o-mini
+      OPENAI_BASE_URL: https://api.openai.com/v1
+
     depends_on:
       - db
     ports:

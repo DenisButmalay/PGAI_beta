@@ -41,7 +41,8 @@ class ReportOut(BaseModel):
     created_at: datetime
     databases: List[str]
     blocks: List[str]
-    report: Dict[str, Any]
+    payload: Dict[str, Any]
+    report: Dict[str, Any] | None = None
 
     class Config:
         from_attributes = True

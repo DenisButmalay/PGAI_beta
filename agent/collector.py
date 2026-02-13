@@ -340,6 +340,8 @@ async def collect_once_and_analyze(
     mode: str = "recommendation",
 ) -> Dict[str, Any]:
     blocks = blocks or ALL_BLOCKS
+    if "all" in blocks:
+        blocks = ALL_BLOCKS
     want = set(blocks)
 
     # databases: ["all"] -> реально разворачиваем в список баз
